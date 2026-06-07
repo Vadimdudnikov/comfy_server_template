@@ -27,7 +27,7 @@ else
 fi
 
 echo "Запуск ComfyUI на порту $COMFYUI_PORT..."
-python "$COMFYUI_DIR/main.py" --listen 0.0.0.0 --port "$COMFYUI_PORT" > "$LOGS_DIR/comfyui.log" 2>&1 &
+python "$COMFYUI_DIR/main.py" --listen 0.0.0.0 --port "$COMFYUI_PORT" --enable-cors-header '*' > "$LOGS_DIR/comfyui.log" 2>&1 &
 
 COMFYUI_CHECK_URL="http://127.0.0.1:$COMFYUI_PORT/system_stats"
 COMFYUI_READY_MAX_WAIT="${COMFYUI_READY_MAX_WAIT:-600}"
