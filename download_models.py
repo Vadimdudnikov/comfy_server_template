@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Предзагрузка моделей из секции _models в workflow_template.json."""
+"""Предзагрузка моделей из workflow/."""
 import os
 import sys
 from pathlib import Path

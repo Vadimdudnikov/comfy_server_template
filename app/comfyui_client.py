@@ -1,9 +1,8 @@
 """
 Универсальный клиент ComfyUI API.
 
-Один файл workflow.json:
-  - узлы ComfyUI (стандартный API Format)
-  - _inputs, _output, _models внизу (дописывает scripts/inspect_workflow.py --init)
+Workflow читается из папки workflow/ (сырой UI-экспорт ComfyUI).
+Конвертация и _inputs/_output/_models — автоматически при загрузке.
 """
 import copy
 import io
@@ -21,9 +20,9 @@ from typing import Any, Dict, Optional
 import websocket
 from PIL import Image
 
+from .workflow_loader import LoadedWorkflow, load_workflow, resolve_workflow_source
+
 COMFYUI_URL = os.getenv("COMFYUI_URL", "127.0.0.1:8188")
-APP_DIR = Path(__file__).parent
-WORKFLOW_PATH = Path(os.getenv("WORKFLOW_PATH", APP_DIR / "workflow.json"))
 
 
 class ComfyUIClient:
@@ -33,7 +32,7 @@ class ComfyUIClient:
         workflow_path: Optional[Path] = None,
     ):
         self.server_url = server_url
-        self.workflow_path = Path(workflow_path) if workflow_path else WORKFLOW_PATH
+        self.workflow_path = Path(workflow_path) if workflow_path else resolve_workflow_source()
         self.client_id = str(uuid.uuid4())
         self.ws_url = f"ws://{server_url}/ws?clientId={self.client_id}"
         self.ws = None
@@ -42,6 +41,7 @@ class ComfyUIClient:
         self.execution_done = False
         self.execution_error = None
         self._workflow_template = None
+        self._loaded: Optional[LoadedWorkflow] = None
         self._models_info: Dict[str, Any] = {}
         self._inputs_config: Dict[str, Any] = {}
         self._output_config: Dict[str, Any] = {}
@@ -51,40 +51,29 @@ class ComfyUIClient:
         if self._workflow_template is not None:
             return self._workflow_template
 
-        workflow_path = self.workflow_path
-        try:
-            with open(workflow_path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(
-                f"workflow.json не найден: {workflow_path}\n"
-                f"Экспортируйте из ComfyUI: Save → API Format"
-            ) from exc
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Ошибка парсинга {workflow_path}: {exc}") from exc
+        loaded = load_workflow(self.workflow_path)
+        self._loaded = loaded
+        self._workflow_template = loaded.workflow
+        self._inputs_config = loaded.inputs_config
+        self._output_config = loaded.output_config
+        self._models_info = loaded.models_info
 
-        workflow = {k: v for k, v in raw.items() if not str(k).startswith("_")}
-        self._inputs_config = raw.get("_inputs", {}) or {}
-        self._output_config = raw.get("_output", {}) or {}
-        self._models_info = raw.get("_models", {}) or {}
-
-        if not self._inputs_config:
-            raise ValueError(
-                f"Секция _inputs отсутствует в {workflow_path}\n"
-                f"Запустите: python scripts/inspect_workflow.py --init"
-            )
-
-        print(f"Загружен workflow: {workflow_path} ({len(workflow)} узлов)", flush=True)
+        print(
+            f"Загружен workflow: {loaded.source_path} "
+            f"({loaded.source_format}, {len(loaded.workflow)} узлов)",
+            flush=True,
+        )
         print(f"Параметры API: {list(self._inputs_config.keys())}", flush=True)
-        self._workflow_template = workflow
-        return workflow
+        return self._workflow_template
 
     def reload_workflow(self) -> None:
-        """Сбрасывает кэш после замены workflow_template.json."""
+        """Сбрасывает кэш после замены файла в workflow/."""
         self._workflow_template = None
+        self._loaded = None
         self._models_info = {}
         self._inputs_config = {}
         self._output_config = {}
+        self.workflow_path = resolve_workflow_source(self.workflow_path)
         self._load_workflow_template()
 
     def get_models_info(self) -> Dict[str, Any]:
@@ -100,8 +89,8 @@ class ComfyUIClient:
     def _apply_inputs(self, workflow: Dict[str, Any], inputs: Dict[str, Any]) -> Dict[str, Any]:
         if not self._inputs_config:
             raise ValueError(
-                "Секция _inputs отсутствует в workflow_template.json. "
-                "Добавьте маппинг параметров API → узлы ComfyUI."
+                "Не удалось собрать параметры API из workflow/. "
+                "Проверьте файл в папке workflow/."
             )
 
         for param_name, mapping in self._inputs_config.items():

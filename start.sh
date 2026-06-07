@@ -14,8 +14,15 @@ COMFYUI_URL="${COMFYUI_URL:-127.0.0.1:$COMFYUI_PORT}"
 
 export COMFYUI_URL
 export COMFYUI_BASE_DIR="$COMFYUI_DIR"
-export WORKFLOW_PATH="${WORKFLOW_PATH:-$SCRIPT_DIR/app/workflow.json}"
+export WORKFLOW_DIR="${WORKFLOW_DIR:-$SCRIPT_DIR/workflow}"
+export WORKFLOW_NAME="${WORKFLOW_NAME:-${1:-}}"
 export STATIC_DIR="${STATIC_DIR:-$SCRIPT_DIR/static}"
+
+if [ -n "$WORKFLOW_NAME" ]; then
+  echo "== Workflow: $WORKFLOW_NAME =="
+else
+  echo "== Workflow: (по умолчанию) =="
+fi
 
 echo "== ComfyUI =="
 if [ ! -d "$COMFYUI_DIR" ]; then

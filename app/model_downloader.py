@@ -1,12 +1,13 @@
 """
-Автозагрузка моделей из секции _models в workflow_template.json.
+Автозагрузка моделей из workflow/ (собирается автоматически при загрузке).
 """
 import os
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .comfyui_client import ComfyUIClient, WORKFLOW_PATH
+from .comfyui_client import ComfyUIClient
+from .workflow_loader import resolve_workflow_source
 
 
 def _is_safetensors_corrupted(path: Path) -> bool:
@@ -72,7 +73,7 @@ def ensure_models_ready(
     if comfyui_base_dir is None:
         comfyui_base_dir = get_comfyui_base_dir()
 
-    client = ComfyUIClient(workflow_path=workflow_path or WORKFLOW_PATH)
+    client = ComfyUIClient(workflow_path=workflow_path or resolve_workflow_source())
     models_info = client.get_models_info()
 
     if not models_info:

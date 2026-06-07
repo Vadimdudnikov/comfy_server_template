@@ -131,7 +131,7 @@ def workflow_inputs():
 
 @app.post("/workflow/reload")
 def workflow_reload():
-    """Перечитать workflow_template.json после замены файла."""
+    """Перечитать workflow из папки workflow/ после замены файла."""
     reload_client()
     return {"status": "ok", "inputs": get_client().get_inputs_config()}
 
