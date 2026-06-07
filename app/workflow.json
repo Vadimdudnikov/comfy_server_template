@@ -1,7 +1,7 @@
 {
   "9": {
     "inputs": {
-      "filename_prefix": "output",
+      "filename_prefix": "z-image",
       "images": [
         "43",
         0
@@ -108,26 +108,6 @@
     "class_type": "ModelSamplingAuraFlow"
   },
   "_inputs": {
-    "9_filename_prefix": {
-      "node": "9",
-      "field": "filename_prefix"
-    },
-    "39_clip_name": {
-      "node": "39",
-      "field": "clip_name"
-    },
-    "39_type": {
-      "node": "39",
-      "field": "type"
-    },
-    "39_device": {
-      "node": "39",
-      "field": "device"
-    },
-    "40_vae_name": {
-      "node": "40",
-      "field": "vae_name"
-    },
     "41_width": {
       "node": "41",
       "field": "width"
@@ -168,14 +148,6 @@
       "node": "45",
       "field": "text"
     },
-    "46_unet_name": {
-      "node": "46",
-      "field": "unet_name"
-    },
-    "46_weight_dtype": {
-      "node": "46",
-      "field": "weight_dtype"
-    },
     "47_shift": {
       "node": "47",
       "field": "shift"
@@ -184,5 +156,27 @@
   "_output": {
     "node": "9"
   },
-  "_models": {}
+  "_models": {
+    "clip": {
+      "qwen_3_4b.safetensors": {
+        "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors",
+        "path": "models/clip/qwen_3_4b.safetensors",
+        "description": "CLIP модель для z_image (lumina2)"
+      }
+    },
+    "vae": {
+      "ae.safetensors": {
+        "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors",
+        "path": "models/vae/ae.safetensors",
+        "description": "VAE модель для z_image"
+      }
+    },
+    "unet": {
+      "z_image_turbo_bf16.safetensors": {
+        "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+        "path": "models/unet/z_image_turbo_bf16.safetensors",
+        "description": "UNET модель для z_image turbo"
+      }
+    }
+  }
 }
