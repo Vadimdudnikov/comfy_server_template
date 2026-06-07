@@ -16,11 +16,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import os
+
 from app.workflow_loader import (
     WORKFLOW_DIR,
     auto_build_inputs,
     auto_build_models,
-    build_meta,
     find_output_nodes,
     has_subgraph_ids,
     is_editable,
@@ -28,13 +29,10 @@ from app.workflow_loader import (
     is_ui_workflow,
     load_workflow,
     merge_models,
-    prepare_workflow_data,
-    resolve_workflow_source,
+    resolve_workflow_by_name,
     sort_node_ids,
     split_workflow,
 )
-
-DEFAULT_WORKFLOW = WORKFLOW_DIR / "workflow.json"
 
 
 def print_workflow_table(workflow, meta) -> None:
@@ -80,10 +78,19 @@ def main():
     parser.add_argument("--workflow", type=Path, default=None, help="Файл workflow для просмотра")
     args = parser.parse_args()
 
-    path = args.workflow or resolve_workflow_source()
+    if args.workflow:
+        path = args.workflow
+    elif os.getenv("WORKFLOW_NAME", "").strip():
+        path = resolve_workflow_by_name(WORKFLOW_DIR, os.environ["WORKFLOW_NAME"])
+    else:
+        available = sorted(p.stem for p in WORKFLOW_DIR.glob("*.json"))
+        print("Укажите --workflow workflow/<name>.json или WORKFLOW_NAME=<name>")
+        if available:
+            print(f"Доступные: {', '.join(available)}")
+        sys.exit(1)
+
     if not path.exists():
         print(f"Не найден: {path}")
-        print("Положите UI-экспорт ComfyUI в workflow/workflow.json")
         sys.exit(1)
 
     loaded = load_workflow(path)

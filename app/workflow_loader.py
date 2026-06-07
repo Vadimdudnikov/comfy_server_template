@@ -128,32 +128,15 @@ def resolve_workflow_source(path: Optional[Path] = None) -> Path:
     workflow_dir = Path(os.getenv("WORKFLOW_DIR", WORKFLOW_DIR))
 
     workflow_name = os.getenv("WORKFLOW_NAME", "").strip()
-    if workflow_name:
-        return resolve_workflow_by_name(workflow_dir, workflow_name)
-
-    default = workflow_dir / "workflow.json"
-    if default.exists():
-        return default
-
-    json_files = sorted(
-        workflow_dir.glob("*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if len(json_files) == 1:
-        return json_files[0]
-    if len(json_files) > 1:
-        available = ", ".join(p.stem for p in json_files)
+    if not workflow_name:
+        available = sorted(p.stem for p in workflow_dir.glob("*.json"))
+        hint = f"Доступные: {', '.join(available)}" if available else "Папка workflow/ пуста"
         raise FileNotFoundError(
-            f"В {workflow_dir} несколько workflow. Укажите WORKFLOW_NAME.\n"
-            f"Доступные: {available}"
+            "WORKFLOW_NAME не задан. Без него запускается только ComfyUI.\n"
+            f"Для API-сервиса: WORKFLOW_NAME=<name> (без .json). {hint}"
         )
 
-    raise FileNotFoundError(
-        f"Workflow не найден в {workflow_dir}\n"
-        f"Положите UI-экспорт ComfyUI в workflow/<name>.json "
-        f"и задайте WORKFLOW_NAME=<name>"
-    )
+    return resolve_workflow_by_name(workflow_dir, workflow_name)
 
 
 def is_editable(value: Any) -> bool:

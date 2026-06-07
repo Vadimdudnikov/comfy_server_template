@@ -18,12 +18,6 @@ export WORKFLOW_DIR="${WORKFLOW_DIR:-$SCRIPT_DIR/workflow}"
 export WORKFLOW_NAME="${WORKFLOW_NAME:-${1:-}}"
 export STATIC_DIR="${STATIC_DIR:-$SCRIPT_DIR/static}"
 
-if [ -n "$WORKFLOW_NAME" ]; then
-  echo "== Workflow: $WORKFLOW_NAME =="
-else
-  echo "== Workflow: (по умолчанию) =="
-fi
-
 echo "== ComfyUI =="
 if [ ! -d "$COMFYUI_DIR" ]; then
   echo "Клонирую ComfyUI в $COMFYUI_DIR..."
@@ -49,6 +43,15 @@ until curl -sf "$COMFYUI_CHECK_URL" >/dev/null 2>&1; do
   fi
 done
 echo "ComfyUI готов (${elapsed}с)"
+
+if [ -z "$WORKFLOW_NAME" ]; then
+  echo "== Режим: только ComfyUI (WORKFLOW_NAME не задан) =="
+  echo "UI: http://0.0.0.0:$COMFYUI_PORT"
+  wait
+  exit 0
+fi
+
+echo "== Workflow: $WORKFLOW_NAME =="
 
 echo "== Зависимости сервиса =="
 pip install -r "$SCRIPT_DIR/requirements.txt"
