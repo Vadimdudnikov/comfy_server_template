@@ -22,10 +22,15 @@ echo "== ComfyUI =="
 if [ ! -d "$COMFYUI_DIR" ]; then
   echo "Клонирую ComfyUI в $COMFYUI_DIR..."
   git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_DIR"
-  pip install -r "$COMFYUI_DIR/requirements.txt"
 else
   echo "ComfyUI уже установлен: $COMFYUI_DIR"
 fi
+
+echo "== Зависимости ComfyUI =="
+pip install -r "$COMFYUI_DIR/requirements.txt"
+
+echo "== Совместимость comfy-kitchen / torch =="
+python "$SCRIPT_DIR/scripts/fix_comfy_deps.py"
 
 echo "Запуск ComfyUI на порту $COMFYUI_PORT..."
 python "$COMFYUI_DIR/main.py" --listen 0.0.0.0 --port "$COMFYUI_PORT" --enable-cors-header '*' > "$LOGS_DIR/comfyui.log" 2>&1 &
@@ -39,6 +44,8 @@ until curl -sf "$COMFYUI_CHECK_URL" >/dev/null 2>&1; do
   elapsed=$((elapsed + COMFYUI_READY_INTERVAL))
   if [ "$elapsed" -ge "$COMFYUI_READY_MAX_WAIT" ]; then
     echo "ComfyUI не ответил за ${COMFYUI_READY_MAX_WAIT}с. Лог: $LOGS_DIR/comfyui.log"
+    echo "--- tail comfyui.log ---"
+    tail -n 40 "$LOGS_DIR/comfyui.log" || true
     exit 1
   fi
 done
