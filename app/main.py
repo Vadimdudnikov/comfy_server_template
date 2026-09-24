@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -82,6 +82,15 @@ TASKS: Dict[str, Dict[str, Any]] = {}
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 
+STATUS_MAP = {
+    "queued": "QUEUED",
+    "processing": "PROCESSING",
+    "completed": "COMPLETED",
+    "failed": "FAILED",
+    "not_found": "NOT_FOUND",
+}
+
+
 def _now_ts() -> float:
     return time.time()
 
@@ -90,27 +99,123 @@ def _build_static_url(file_path: str) -> str:
     return f"{STATIC_URL}/{Path(file_path).name}"
 
 
-def _absolute_url(relative_url: Optional[str]) -> Optional[str]:
+def _is_unusable_host(host: str) -> bool:
+    host = host.lower().split(":")[0]
+    return host in {"", "0.0.0.0", "127.0.0.1", "localhost", "::", "::1"}
+
+
+def _resolve_public_base(request: Optional[Request] = None) -> str:
+    """Публичный origin сервиса: из заголовков прокси / Host запроса."""
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    if request is None:
+        return ""
+
+    headers = request.headers
+
+    # RFC 7239: Forwarded: proto=https;host=example.com
+    forwarded = headers.get("forwarded") or ""
+    fwd_host = ""
+    fwd_proto = ""
+    if forwarded:
+        first = forwarded.split(",")[0]
+        for part in first.split(";"):
+            part = part.strip()
+            if part.lower().startswith("host="):
+                fwd_host = part.split("=", 1)[1].strip().strip('"')
+            elif part.lower().startswith("proto="):
+                fwd_proto = part.split("=", 1)[1].strip().strip('"')
+
+    host = (
+        fwd_host
+        or (headers.get("x-forwarded-host") or "").split(",")[0].strip()
+        or (headers.get("x-original-host") or "").split(",")[0].strip()
+        or (headers.get("host") or "").strip()
+    )
+    proto = (
+        fwd_proto
+        or (headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+        or (headers.get("x-forwarded-scheme") or "").split(",")[0].strip()
+        or (headers.get("x-scheme") or "").split(",")[0].strip()
+    )
+
+    if host and not _is_unusable_host(host):
+        if not proto:
+            # RunPod / публичные прокси почти всегда https
+            if "runpod.net" in host.lower() or "runpod.ai" in host.lower():
+                proto = "https"
+            else:
+                proto = request.url.scheme or "http"
+        return f"{proto}://{host}".rstrip("/")
+
+    base = str(request.base_url).rstrip("/")
+    parsed = urlparse(base)
+    if parsed.hostname and not _is_unusable_host(parsed.hostname):
+        return base
+    return ""
+
+
+def _image_url(relative_url: Optional[str], public_base: Optional[str] = None) -> Optional[str]:
     if not relative_url:
         return None
     if relative_url.startswith("http://") or relative_url.startswith("https://"):
         return relative_url
-    if not PUBLIC_BASE_URL:
+
+    base = (public_base or "").rstrip("/")
+    if not base:
         return None
-    return f"{PUBLIC_BASE_URL}{relative_url}"
+    path = relative_url if relative_url.startswith("/") else f"/{relative_url}"
+    return f"{base}{path}"
 
 
-def _task_payload(job_id: str) -> Dict[str, Any]:
-    task = TASKS.get(job_id, {})
-    url = task.get("url")
-    return {
+def _public_status(status: Optional[str]) -> str:
+    if not status:
+        return "UNKNOWN"
+    return STATUS_MAP.get(str(status).lower(), str(status).upper())
+
+
+def _ensure_task_public_base(job_id: str, request: Optional[Request] = None) -> None:
+    task = TASKS.get(job_id)
+    if not task:
+        return
+    resolved = _resolve_public_base(request)
+    if not resolved:
+        return
+    current = (task.get("public_base_url") or "").rstrip("/")
+    if not current or _is_unusable_host(urlparse(current).hostname or ""):
+        task["public_base_url"] = resolved
+
+
+def _task_payload(job_id: str, request: Optional[Request] = None) -> Dict[str, Any]:
+    task = TASKS.get(job_id)
+    if not task:
+        return {"id": job_id, "status": "NOT_FOUND"}
+
+    _ensure_task_public_base(job_id, request)
+
+    status = _public_status(task.get("status"))
+    payload: Dict[str, Any] = {
         "id": job_id,
-        "status": task.get("status"),
-        "file": task.get("file"),
-        "url": url,
-        "absolute_url": _absolute_url(url),
-        "error": task.get("error"),
+        "status": status,
     }
+
+    if status == "COMPLETED":
+        image_url = task.get("image_url") or _image_url(
+            task.get("url"),
+            task.get("public_base_url"),
+        )
+        if image_url and not image_url.startswith("http"):
+            image_url = _image_url(task.get("url"), task.get("public_base_url"))
+        if not image_url:
+            payload["status"] = "FAILED"
+            payload["error"] = "Не удалось определить публичный URL сервиса для image_url"
+        else:
+            task["image_url"] = image_url
+            payload["output"] = {"image_url": image_url}
+    elif status == "FAILED":
+        payload["error"] = task.get("error")
+
+    return payload
 
 
 def _send_webhook(webhook_url: str, payload: Dict[str, Any]) -> None:
@@ -159,14 +264,20 @@ def _worker_loop():
 
             try:
                 out_path = run_pipeline(job.inputs, filename=f"{uuid.uuid4().hex}.png")
+                relative = _build_static_url(out_path)
                 TASKS[job.id]["file"] = out_path
-                TASKS[job.id]["url"] = _build_static_url(out_path)
+                TASKS[job.id]["url"] = relative
+                TASKS[job.id]["image_url"] = _image_url(
+                    relative,
+                    TASKS[job.id].get("public_base_url"),
+                )
                 TASKS[job.id]["status"] = "completed"
                 TASKS[job.id]["updated_at"] = _now_ts()
                 if MAIN_LOOP and not job.future.done():
                     MAIN_LOOP.call_soon_threadsafe(job.future.set_result, {
                         "file": out_path,
-                        "url": TASKS[job.id]["url"],
+                        "url": relative,
+                        "image_url": TASKS[job.id]["image_url"],
                     })
             except Exception as e:
                 TASKS[job.id]["status"] = "failed"
@@ -217,18 +328,23 @@ def workflow_reload():
 
 
 @app.post("/run")
-async def run(req: RunRequest):
+async def run(req: RunRequest, request: Request):
     job_id = uuid.uuid4().hex
     priority = (req.priority or "low").lower()
+    public_base = _resolve_public_base(request)
+    if public_base:
+        print(f"public_base_url={public_base}", flush=True)
 
     TASKS[job_id] = {
         "status": "queued",
         "priority": priority,
         "file": None,
         "url": None,
+        "image_url": None,
         "error": None,
         "inputs": req.inputs,
         "webhook_url": req.webhook_url,
+        "public_base_url": public_base,
         "created_at": _now_ts(),
         "updated_at": _now_ts(),
     }
@@ -245,24 +361,17 @@ async def run(req: RunRequest):
     if req.wait:
         try:
             await fut
+            return _task_payload(job_id, request)
+        except Exception as e:
             return {
                 "id": job_id,
-                "status": TASKS[job_id]["status"],
-                "file": TASKS[job_id]["file"],
-                "url": TASKS[job_id]["url"],
-                "absolute_url": _absolute_url(TASKS[job_id]["url"]),
+                "status": "FAILED",
+                "error": str(e),
             }
-        except Exception as e:
-            return {"id": job_id, "status": "failed", "error": str(e)}
 
-    return {"id": job_id, "status": "queued"}
+    return {"id": job_id, "status": "QUEUED"}
 
 
 @app.get("/status/{task_id}")
-def status(task_id: str):
-    task = TASKS.get(task_id)
-    if not task:
-        return {"status": "not_found"}
-    payload = _task_payload(task_id)
-    payload["inputs"] = task.get("inputs")
-    return payload
+def status(task_id: str, request: Request):
+    return _task_payload(task_id, request)
