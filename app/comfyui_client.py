@@ -10,6 +10,7 @@ import io
 import json
 import mimetypes
 import os
+import random
 import re
 import threading
 import time
@@ -332,6 +333,11 @@ class ComfyUIClient:
             prepared[param_name] = value
         return prepared
 
+    def _resolve_seed_value(self, value: Any) -> Any:
+        if isinstance(value, str) and value.strip().lower() == "random":
+            return random.randint(0, 2**63 - 1)
+        return value
+
     def _prepare_inputs(
         self,
         inputs: Dict[str, Any],
@@ -359,6 +365,8 @@ class ComfyUIClient:
             if mapping.get("type") == "image_array":
                 continue
             field = str(mapping.get("field", ""))
+            if field in {"seed", "noise_seed"} or param_name == "seed":
+                prepared[param_name] = self._resolve_seed_value(prepared[param_name])
             if field == "image" or field.startswith("image_"):
                 prepared[param_name] = self._ensure_comfy_image(prepared[param_name])
         return prepared

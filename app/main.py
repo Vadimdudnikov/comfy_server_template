@@ -43,12 +43,12 @@ def check_comfyui_connection() -> bool:
 class RunRequest(BaseModel):
     inputs: Dict[str, Any] = Field(default_factory=dict)
     priority: Optional[str] = "low"
-    wait: Optional[bool] = True
-    webhook_url: Optional[str] = None
+    wait: Optional[bool] = False
+    callBackUrl: Optional[str] = None
 
-    @field_validator("webhook_url")
+    @field_validator("callBackUrl")
     @classmethod
-    def validate_webhook_url(cls, value: Optional[str]) -> Optional[str]:
+    def validate_call_back_url(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         url = value.strip()
@@ -56,7 +56,7 @@ class RunRequest(BaseModel):
             return None
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError("webhook_url должен быть http(s)://...")
+            raise ValueError("callBackUrl должен быть http(s)://...")
         return url
 
 
@@ -67,13 +67,13 @@ class Job:
         inputs: Dict[str, Any],
         priority: str,
         future: "asyncio.Future",
-        webhook_url: Optional[str] = None,
+        call_back_url: Optional[str] = None,
     ):
         self.id = job_id
         self.inputs = inputs
         self.priority = priority
         self.future = future
-        self.webhook_url = webhook_url
+        self.call_back_url = call_back_url
 
 
 HIGH_Q: deque[Job] = deque()
@@ -237,12 +237,12 @@ def _send_webhook(webhook_url: str, payload: Dict[str, Any]) -> None:
 
 
 def _notify_webhook(job: Job) -> None:
-    if not job.webhook_url:
+    if not job.call_back_url:
         return
     payload = _task_payload(job.id)
     threading.Thread(
         target=_send_webhook,
-        args=(job.webhook_url, payload),
+        args=(job.call_back_url, payload),
         daemon=True,
     ).start()
 
@@ -343,7 +343,7 @@ async def run(req: RunRequest, request: Request):
         "image_url": None,
         "error": None,
         "inputs": req.inputs,
-        "webhook_url": req.webhook_url,
+        "callBackUrl": req.callBackUrl,
         "public_base_url": public_base,
         "created_at": _now_ts(),
         "updated_at": _now_ts(),
@@ -351,7 +351,7 @@ async def run(req: RunRequest, request: Request):
 
     assert MAIN_LOOP is not None
     fut: asyncio.Future = MAIN_LOOP.create_future()
-    job = Job(job_id, req.inputs, priority, fut, webhook_url=req.webhook_url)
+    job = Job(job_id, req.inputs, priority, fut, call_back_url=req.callBackUrl)
 
     if priority == "high":
         HIGH_Q.append(job)
