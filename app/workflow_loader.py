@@ -137,6 +137,7 @@ class LoadedWorkflow:
     output_config: Dict[str, Any]
     models_info: Dict[str, Any]
     source_format: str
+    raw_data: Optional[Dict[str, Any]] = None
 
 
 def normalize_workflow_name(name: str) -> str:
@@ -561,6 +562,110 @@ def ui_to_api_workflow(data: Dict[str, Any]) -> Dict[str, Any]:
     return workflow
 
 
+def _count_subgraph_image_inputs(subgraph: Dict[str, Any]) -> int:
+    return sum(1 for inp in subgraph.get("inputs", []) if inp.get("type") == "IMAGE")
+
+
+def _iter_top_links(data: Dict[str, Any]) -> List[Tuple[int, int]]:
+    """(origin_id, target_id) для top-level links."""
+    pairs: List[Tuple[int, int]] = []
+    for link in data.get("links", []):
+        if isinstance(link, list) and len(link) >= 6:
+            pairs.append((int(link[1]), int(link[3])))
+        elif isinstance(link, dict):
+            pairs.append((int(link["origin_id"]), int(link["target_id"])))
+    return pairs
+
+
+def select_image_edit_path(data: Dict[str, Any], num_images: int) -> Dict[str, Any]:
+    """
+    Для UI-workflow с single/dual image-edit subgraph:
+    включает нужный путь и bypass лишних LoadImage/SaveImage.
+    """
+    if not is_ui_workflow(data):
+        return data
+
+    subgraphs = {sg["id"]: sg for sg in data.get("definitions", {}).get("subgraphs", [])}
+    if not subgraphs:
+        return data
+
+    data = copy.deepcopy(data)
+    wrappers: List[Tuple[Dict[str, Any], int]] = []
+    for node in data.get("nodes", []):
+        node_type = node.get("type")
+        if node_type not in subgraphs:
+            continue
+        image_count = _count_subgraph_image_inputs(subgraphs[node_type])
+        if image_count >= 1:
+            wrappers.append((node, image_count))
+
+    if len(wrappers) < 2:
+        return data
+
+    target = 2 if num_images >= 2 else 1
+    chosen = next((node for node, n_img in wrappers if n_img == target), None)
+    if chosen is None:
+        chosen = min(wrappers, key=lambda item: abs(item[1] - target))[0]
+
+    chosen_id = int(chosen["id"])
+    wrapper_ids = {int(node["id"]) for node, _ in wrappers}
+
+    feeds_save: Dict[int, List[int]] = {}
+    loads_into: Dict[int, List[int]] = {}
+    load_ids = {
+        int(node["id"])
+        for node in data.get("nodes", [])
+        if node.get("type") == "LoadImage"
+    }
+    save_ids = {
+        int(node["id"])
+        for node in data.get("nodes", [])
+        if node.get("type") in OUTPUT_CLASS_TYPES
+    }
+
+    for origin_id, target_id in _iter_top_links(data):
+        if origin_id in wrapper_ids and target_id in save_ids:
+            feeds_save.setdefault(origin_id, []).append(target_id)
+        if origin_id in load_ids and target_id in wrapper_ids:
+            loads_into.setdefault(target_id, []).append(origin_id)
+
+    active_saves = set(feeds_save.get(chosen_id, []))
+    active_loads = set(loads_into.get(chosen_id, []))
+
+    for node in data.get("nodes", []):
+        nid = int(node["id"])
+        node_type = node.get("type")
+        if node_type in subgraphs and _count_subgraph_image_inputs(subgraphs[node_type]) >= 1:
+            node["mode"] = 0 if nid == chosen_id else BYPASS_MODE
+        elif node_type == "LoadImage" and nid in load_ids:
+            # Неактивные LoadImage не должны попадать в prompt — ComfyUI валидирует файлы
+            node["mode"] = 0 if nid in active_loads else BYPASS_MODE
+        elif node_type in OUTPUT_CLASS_TYPES and nid in save_ids:
+            # SaveImage, связанные с image-edit путями
+            related = any(nid in feeds_save.get(wid, []) for wid in wrapper_ids)
+            if related:
+                node["mode"] = 0 if nid in active_saves else BYPASS_MODE
+
+    return data
+
+
+def max_reference_images(data: Dict[str, Any]) -> int:
+    if not is_ui_workflow(data):
+        return 0
+    subgraphs = data.get("definitions", {}).get("subgraphs", [])
+    counts = [_count_subgraph_image_inputs(sg) for sg in subgraphs]
+    return max(counts) if counts else 0
+
+
+def build_workflow_variant(
+    raw: Dict[str, Any],
+    num_images: int,
+) -> tuple[Dict[str, Any], Dict[str, Any], str]:
+    """Готовит API-workflow под N референсов (single/dual path)."""
+    selected = select_image_edit_path(raw, num_images) if is_ui_workflow(raw) else raw
+    return prepare_workflow_data(selected)
+
+
 def extract_models_from_ui_nodes(ui_nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
     models: Dict[str, Any] = {}
 
@@ -781,13 +886,31 @@ def load_workflow(source: Optional[Path] = None) -> LoadedWorkflow:
     except json.JSONDecodeError as exc:
         raise ValueError(f"Ошибка парсинга {path}: {exc}") from exc
 
-    workflow, meta, source_format = prepare_workflow_data(raw)
+    # По умолчанию single-image путь (1 референс)
+    selected = select_image_edit_path(raw, 1) if is_ui_workflow(raw) else raw
+    workflow, meta, source_format = prepare_workflow_data(selected)
     built = build_meta(workflow, meta)
 
     if not built["_inputs"]:
         raise ValueError(f"Не удалось собрать параметры API из {path}")
     if not built["_output"].get("node"):
         raise ValueError(f"Не найден выходной узел (SaveImage и т.п.) в {path}")
+
+    # В метаданных images отразим максимальное число референсов из UI
+    max_images = max_reference_images(raw) if is_ui_workflow(raw) else 0
+    if max_images > 0:
+        image_nodes = [
+            node_id
+            for node_id in sort_node_ids(list(workflow.keys()))
+            if workflow[node_id].get("class_type") == "LoadImage"
+        ]
+        built["_inputs"]["images"] = {
+            "type": "image_array",
+            "field": "image",
+            "nodes": image_nodes,
+            "max_items": max_images,
+            "min_items": 1,
+        }
 
     return LoadedWorkflow(
         source_path=path,
@@ -796,4 +919,5 @@ def load_workflow(source: Optional[Path] = None) -> LoadedWorkflow:
         output_config=built["_output"],
         models_info=built["_models"],
         source_format=source_format,
+        raw_data=raw if is_ui_workflow(raw) else None,
     )

@@ -23,7 +23,15 @@ from typing import Any, Dict, Optional, Tuple
 import websocket
 from PIL import Image
 
-from .workflow_loader import LoadedWorkflow, load_workflow, resolve_workflow_source
+from .workflow_loader import (
+    LoadedWorkflow,
+    build_meta,
+    load_workflow,
+    max_reference_images,
+    resolve_workflow_source,
+    select_image_edit_path,
+    prepare_workflow_data,
+)
 
 COMFYUI_URL = os.getenv("COMFYUI_URL", "127.0.0.1:8188")
 DATA_URL_RE = re.compile(r"^data:([^;]+);base64,(.+)$", re.DOTALL)
@@ -50,6 +58,8 @@ class ComfyUIClient:
         self._models_info: Dict[str, Any] = {}
         self._inputs_config: Dict[str, Any] = {}
         self._output_config: Dict[str, Any] = {}
+        self._raw_ui: Optional[Dict[str, Any]] = None
+        self._variant_cache: Dict[int, Dict[str, Any]] = {}
         self._ws_initialized = False
 
     def _load_workflow_template(self) -> Dict[str, Any]:
@@ -62,6 +72,8 @@ class ComfyUIClient:
         self._inputs_config = loaded.inputs_config
         self._output_config = loaded.output_config
         self._models_info = loaded.models_info
+        self._raw_ui = loaded.raw_data
+        self._variant_cache = {}
 
         print(
             f"Загружен workflow: {loaded.source_path} "
@@ -78,6 +90,8 @@ class ComfyUIClient:
         self._models_info = {}
         self._inputs_config = {}
         self._output_config = {}
+        self._raw_ui = None
+        self._variant_cache = {}
         self.workflow_path = resolve_workflow_source(self.workflow_path)
         self._load_workflow_template()
 
@@ -104,6 +118,40 @@ class ComfyUIClient:
             return True
         return False
 
+    def _download_url(self, url: str) -> Tuple[bytes, str]:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                raw = response.read()
+                content_type = response.headers.get("Content-Type", "image/png")
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(
+                f"Не удалось скачать изображение ({e.code} {e.reason}): {url}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"Не удалось скачать изображение: {url} ({e})") from e
+
+        if not raw:
+            raise RuntimeError(f"Пустой ответ при скачивании изображения: {url}")
+
+        mime = content_type.split(";")[0].strip() or "image/png"
+        ext = mimetypes.guess_extension(mime) or Path(urllib.parse.urlparse(url).path).suffix or ".png"
+        if ext == ".jpe":
+            ext = ".jpg"
+        name = Path(urllib.parse.urlparse(url).path).name or f"upload{ext}"
+        if "." not in name:
+            name = f"{name}{ext}"
+        return raw, name
+
     def _decode_image_payload(self, value: str) -> Tuple[bytes, str]:
         text = value.strip()
         match = DATA_URL_RE.match(text)
@@ -116,16 +164,7 @@ class ComfyUIClient:
             return raw, f"upload{ext}"
 
         if text.startswith("http://") or text.startswith("https://"):
-            with urllib.request.urlopen(text, timeout=60) as response:
-                raw = response.read()
-                content_type = response.headers.get("Content-Type", "image/png")
-            ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ".png"
-            if ext == ".jpe":
-                ext = ".jpg"
-            name = Path(urllib.parse.urlparse(text).path).name or f"upload{ext}"
-            if "." not in name:
-                name = f"{name}{ext}"
-            return raw, name
+            return self._download_url(text)
 
         # Сырой base64
         raw = base64.b64decode(text)
@@ -189,20 +228,85 @@ class ComfyUIClient:
         print(f"Загружен референс в ComfyUI: {uploaded}", flush=True)
         return uploaded
 
-    def _image_alias_params(self) -> list[str]:
+    def _count_request_images(self, inputs: Dict[str, Any]) -> int:
+        if "images" in inputs and isinstance(inputs["images"], (list, tuple)):
+            return len(inputs["images"])
+        if isinstance(inputs.get("image"), (list, tuple)):
+            return len(inputs["image"])
+        count = 0
+        if isinstance(inputs.get("image"), str) and inputs.get("image", "").strip():
+            count += 1
+        index = 1
+        while True:
+            key = f"image_{index}"
+            if key not in inputs:
+                break
+            if isinstance(inputs[key], str) and str(inputs[key]).strip():
+                count += 1
+            index += 1
+        return count
+
+    def _workflow_for_images(self, num_images: int) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """Возвращает (workflow, inputs_config, output_config) под N картинок."""
+        self._load_workflow_template()
+        if not self._raw_ui:
+            return (
+                self._workflow_template,
+                self._inputs_config,
+                self._output_config,
+            )
+
+        key = 2 if num_images >= 2 else 1
+        if key not in self._variant_cache:
+            selected = select_image_edit_path(self._raw_ui, key)
+            workflow, meta, _ = prepare_workflow_data(selected)
+            built = build_meta(workflow, meta)
+            max_images = max_reference_images(self._raw_ui)
+            if max_images > 0:
+                built["_inputs"]["images"] = {
+                    "type": "image_array",
+                    "field": "image",
+                    "nodes": [
+                        nid
+                        for nid, node in workflow.items()
+                        if node.get("class_type") == "LoadImage"
+                    ],
+                    "max_items": max_images,
+                    "min_items": 1,
+                }
+            self._variant_cache[key] = {
+                "workflow": workflow,
+                "inputs_config": built["_inputs"],
+                "output_config": built["_output"],
+            }
+            print(
+                f"Вариант workflow для {key} image(s): "
+                f"{len(workflow)} узлов, inputs={list(built['_inputs'].keys())}",
+                flush=True,
+            )
+
+        variant = self._variant_cache[key]
+        return variant["workflow"], variant["inputs_config"], variant["output_config"]
+
+    def _image_alias_params(self, inputs_config: Optional[Dict[str, Any]] = None) -> list[str]:
         """Порядок слотов референсов: image, image_1, image_2, ..."""
+        cfg = inputs_config if inputs_config is not None else self._inputs_config
         params: list[str] = []
-        if "image" in self._inputs_config and self._inputs_config["image"].get("type") != "image_array":
+        if "image" in cfg and cfg["image"].get("type") != "image_array":
             params.append("image")
         index = 1
-        while f"image_{index}" in self._inputs_config:
+        while f"image_{index}" in cfg:
             params.append(f"image_{index}")
             index += 1
         return params
 
-    def _expand_images_array(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    def _expand_images_array(
+        self,
+        inputs: Dict[str, Any],
+        inputs_config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         prepared = dict(inputs)
-        image_params = self._image_alias_params()
+        image_params = self._image_alias_params(inputs_config)
 
         images_list = None
         if "images" in prepared:
@@ -222,16 +326,34 @@ class ComfyUIClient:
                 f"Передано {len(images_list)} картинок, а в workflow только {len(image_params)} "
                 f"слот(ов): {', '.join(image_params)}"
             )
+        if len(images_list) < 1:
+            raise ValueError("images не должен быть пустым")
         for param_name, value in zip(image_params, images_list):
             prepared[param_name] = value
         return prepared
 
-    def _prepare_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    def _prepare_inputs(
+        self,
+        inputs: Dict[str, Any],
+        inputs_config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         if self._workflow_template is None:
             self._load_workflow_template()
 
-        prepared = self._expand_images_array(inputs)
-        for param_name, mapping in self._inputs_config.items():
+        cfg = inputs_config if inputs_config is not None else self._inputs_config
+        prepared = self._expand_images_array(inputs, cfg)
+
+        image_params = self._image_alias_params(cfg)
+        if image_params:
+            provided = [p for p in image_params if p in prepared and str(prepared[p]).strip()]
+            if not provided:
+                max_items = (cfg.get("images") or {}).get("max_items", len(image_params))
+                raise ValueError(
+                    "Нужен хотя бы один референс: "
+                    f'"images": ["https://..."] (до {max_items})'
+                )
+
+        for param_name, mapping in cfg.items():
             if param_name not in prepared:
                 continue
             if mapping.get("type") == "image_array":
@@ -241,19 +363,27 @@ class ComfyUIClient:
                 prepared[param_name] = self._ensure_comfy_image(prepared[param_name])
         return prepared
 
-    def _apply_inputs(self, workflow: Dict[str, Any], inputs: Dict[str, Any]) -> Dict[str, Any]:
-        if not self._inputs_config:
+    def _apply_inputs(
+        self,
+        workflow: Dict[str, Any],
+        inputs: Dict[str, Any],
+        inputs_config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cfg = inputs_config if inputs_config is not None else self._inputs_config
+        if not cfg:
             raise ValueError(
                 "Не удалось собрать параметры API из workflow/. "
                 "Проверьте файл в папке workflow/."
             )
 
-        prepared = self._prepare_inputs(inputs)
+        prepared = self._prepare_inputs(inputs, cfg)
 
-        for param_name, mapping in self._inputs_config.items():
+        for param_name, mapping in cfg.items():
             if param_name not in prepared:
                 continue
             if mapping.get("type") == "image_array":
+                continue
+            if "node" not in mapping:
                 continue
             node_id = str(mapping["node"])
             field = mapping["field"]
@@ -264,8 +394,12 @@ class ComfyUIClient:
         return workflow
 
     def _queue_prompt(self, inputs: Dict[str, Any]) -> str:
-        workflow = copy.deepcopy(self._load_workflow_template())
-        workflow = self._apply_inputs(workflow, inputs)
+        num_images = self._count_request_images(inputs)
+        workflow_template, inputs_config, output_config = self._workflow_for_images(num_images)
+        self._output_config = output_config
+
+        workflow = copy.deepcopy(workflow_template)
+        workflow = self._apply_inputs(workflow, inputs, inputs_config)
 
         payload = {"prompt": workflow, "client_id": self.client_id}
         data = json.dumps(payload).encode("utf-8")
