@@ -67,11 +67,56 @@ EXTRA_WIDGET_FIELDS: Dict[str, List[str]] = {
     "KSampler": ["seed", "control_after_generate", "steps", "cfg", "sampler_name", "scheduler", "denoise"],
     "CLIPTextEncode": ["text"],
     "SaveImage": ["filename_prefix"],
+    "LoadImage": ["image"],
+    "RandomNoise": ["noise_seed"],
+    "KSamplerSelect": ["sampler_name"],
+    "CFGGuider": ["cfg"],
+    "Flux2Scheduler": ["steps"],
+    "EmptyFlux2LatentImage": ["batch_size"],
+    "ImageScaleToTotalPixels": ["upscale_method", "megapixels", "resolution_steps"],
     "ModelSamplingAuraFlow": ["shift"],
     "StringConcatenate": ["string_b", "delimiter"],
     "EmptySD3LatentImage": ["width", "height", "batch_size"],
     "LoraLoaderModelOnly": ["lora_name", "strength_model"],
 }
+
+# Полный порядок widgets_values у узла (как в ComfyUI), чтобы корректно
+# доставать EXTRA-поля, когда часть виджетов уже пришла через линк/-10.
+WIDGET_ORDER: Dict[str, List[str]] = {
+    "UNETLoader": ["unet_name", "weight_dtype"],
+    "CLIPLoader": ["clip_name", "type", "device"],
+    "VAELoader": ["vae_name"],
+    "CLIPTextEncode": ["text"],
+    "SaveImage": ["filename_prefix"],
+    "LoadImage": ["image", "upload"],
+    "RandomNoise": ["noise_seed", "control_after_generate"],
+    "KSamplerSelect": ["sampler_name"],
+    "CFGGuider": ["cfg"],
+    "Flux2Scheduler": ["steps", "width", "height"],
+    "EmptyFlux2LatentImage": ["width", "height", "batch_size"],
+    "ImageScaleToTotalPixels": ["upscale_method", "megapixels", "resolution_steps"],
+    "ModelSamplingAuraFlow": ["shift"],
+    "EmptySD3LatentImage": ["width", "height", "batch_size"],
+    "LoraLoaderModelOnly": ["lora_name", "strength_model"],
+}
+
+SKIP_WIDGET_FIELDS = frozenset({
+    "upload",
+    "control_after_generate",
+})
+
+
+# Примитивные типы subgraph-входов берутся из widgets_values обёртки.
+# IMAGE/MODEL/... — из внешних линков на обёртку.
+SUBGRAPH_WIDGET_TYPES = frozenset({
+    "INT",
+    "FLOAT",
+    "STRING",
+    "BOOLEAN",
+    "COMBO",
+})
+
+BYPASS_MODE = 4
 
 MODEL_DIR_TO_CATEGORY: Dict[str, str] = {
     "vae": "vae",
@@ -242,63 +287,103 @@ def resolve_subgraph_output(subgraph: Dict[str, Any], slot: int) -> Tuple[str, i
     raise ValueError(f"Subgraph link {link_id} не найден")
 
 
-def resolve_link_origin(
-    link: Dict[str, Any],
+def _wrapper_linked_inputs(wrapper: Dict[str, Any]) -> Dict[str, int]:
+    linked: Dict[str, int] = {}
+    for inp in wrapper.get("inputs", []):
+        link_id = inp.get("link")
+        if link_id is not None:
+            linked[inp["name"]] = int(link_id)
+    return linked
+
+
+def build_subgraph_bindings(
+    wrapper: Dict[str, Any],
+    subgraph: Dict[str, Any],
+    parent_links: Dict[int, Dict[str, Any]],
+    parent_bindings: Optional[Dict[int, Tuple[str, Any]]],
     subgraph_wrappers: Dict[int, str],
     subgraphs_by_uuid: Dict[str, Dict[str, Any]],
-) -> Tuple[str, int]:
+) -> Dict[int, Tuple[str, Any]]:
+    """
+    origin_slot (-10:N) → ('link', [node_id, slot]) | ('value', scalar)
+    """
+    bindings: Dict[int, Tuple[str, Any]] = {}
+    linked = _wrapper_linked_inputs(wrapper)
+    widgets = list(wrapper.get("widgets_values") or [])
+    widget_idx = 0
+
+    for slot, sg_inp in enumerate(subgraph.get("inputs", [])):
+        name = sg_inp.get("name", "")
+        sg_type = str(sg_inp.get("type", ""))
+
+        if name in linked:
+            link = parent_links[linked[name]]
+            bindings[slot] = resolve_binding_origin(
+                link,
+                parent_bindings,
+                subgraph_wrappers,
+                subgraphs_by_uuid,
+            )
+            continue
+
+        if sg_type in SUBGRAPH_WIDGET_TYPES or name not in linked:
+            if widget_idx < len(widgets):
+                bindings[slot] = ("value", widgets[widget_idx])
+                widget_idx += 1
+            else:
+                bindings[slot] = ("value", None)
+
+    return bindings
+
+
+def resolve_binding_origin(
+    link: Dict[str, Any],
+    parent_bindings: Optional[Dict[int, Tuple[str, Any]]],
+    subgraph_wrappers: Dict[int, str],
+    subgraphs_by_uuid: Dict[str, Dict[str, Any]],
+) -> Tuple[str, Any]:
     origin_id = link["origin_id"]
     origin_slot = int(link["origin_slot"])
 
+    if origin_id == -10:
+        if not parent_bindings or origin_slot not in parent_bindings:
+            raise ValueError(f"Не найден binding для subgraph input slot {origin_slot}")
+        return parent_bindings[origin_slot]
+
     if origin_id in subgraph_wrappers:
         subgraph = subgraphs_by_uuid[subgraph_wrappers[origin_id]]
-        return resolve_subgraph_output(subgraph, origin_slot)
-    return str(origin_id), origin_slot
+        ref_id, ref_slot = resolve_subgraph_output(subgraph, origin_slot)
+        return ("link", [ref_id, ref_slot])
+
+    return ("link", [str(origin_id), origin_slot])
 
 
-def collect_ui_graph(
-    data: Dict[str, Any],
-) -> tuple[List[Dict[str, Any]], List[Any], Dict[int, str], Dict[str, Dict[str, Any]]]:
-    subgraphs = data.get("definitions", {}).get("subgraphs", [])
-    subgraphs_by_uuid = {sg["id"]: sg for sg in subgraphs}
-    subgraph_wrappers: Dict[int, str] = {}
-
-    for node in data.get("nodes", []):
-        node_type = node.get("type")
-        if node_type in subgraphs_by_uuid:
-            subgraph_wrappers[int(node["id"])] = node_type
-
-    if subgraphs:
-        primary = subgraphs[0]
-        nodes = list(primary.get("nodes", []))
-        links = list(primary.get("links", []))
-        for node in data.get("nodes", []):
-            node_id = int(node["id"])
-            if node_id in subgraph_wrappers:
-                continue
-            if node.get("type") in SKIP_CLASS_TYPES:
-                continue
-            nodes.append(node)
-        links.extend(data.get("links", []))
-    else:
-        nodes = list(data.get("nodes", []))
-        links = list(data.get("links", []))
-
-    return nodes, links, subgraph_wrappers, subgraphs_by_uuid
+def resolve_link_to_input(
+    link: Dict[str, Any],
+    bindings: Optional[Dict[int, Tuple[str, Any]]],
+    subgraph_wrappers: Dict[int, str],
+    subgraphs_by_uuid: Dict[str, Dict[str, Any]],
+) -> Any:
+    kind, value = resolve_binding_origin(link, bindings, subgraph_wrappers, subgraphs_by_uuid)
+    if kind == "link":
+        return value
+    return value
 
 
 def convert_ui_node_to_api(
     node: Dict[str, Any],
     links_by_id: Dict[int, Dict[str, Any]],
+    bindings: Optional[Dict[int, Tuple[str, Any]]],
     subgraph_wrappers: Dict[int, str],
     subgraphs_by_uuid: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any] | None:
     class_type = node.get("type", "")
     if class_type in SKIP_CLASS_TYPES:
         return None
+    if class_type in subgraphs_by_uuid:
+        return None
 
     widgets_values = list(node.get("widgets_values") or [])
-    widget_idx = 0
     inputs: Dict[str, Any] = {}
 
     for inp in node.get("inputs", []):
@@ -307,38 +392,171 @@ def convert_ui_node_to_api(
 
         if link_id is not None:
             link = links_by_id[int(link_id)]
-            origin_id = link["origin_id"]
-
-            if origin_id == -10:
-                if widget_idx < len(widgets_values):
-                    inputs[name] = widgets_values[widget_idx]
-                    widget_idx += 1
-            else:
-                ref_id, ref_slot = resolve_link_origin(link, subgraph_wrappers, subgraphs_by_uuid)
-                inputs[name] = [ref_id, ref_slot]
+            inputs[name] = resolve_link_to_input(
+                link,
+                bindings,
+                subgraph_wrappers,
+                subgraphs_by_uuid,
+            )
         elif "widget" in inp:
-            if widget_idx < len(widgets_values):
+            # Значение возьмём ниже через WIDGET_ORDER / fallback
+            pass
+
+    order = WIDGET_ORDER.get(class_type)
+    if order and len(widgets_values) >= len(order):
+        for field, value in zip(order, widgets_values):
+            if field in SKIP_WIDGET_FIELDS or field in inputs:
+                continue
+            inputs[field] = value
+    else:
+        widget_idx = 0
+        for inp in node.get("inputs", []):
+            name = inp["name"]
+            if name in inputs:
+                if "widget" in inp:
+                    widget_idx += 1
+                continue
+            if "widget" in inp and widget_idx < len(widgets_values):
                 inputs[name] = widgets_values[widget_idx]
                 widget_idx += 1
-
-    for field in EXTRA_WIDGET_FIELDS.get(class_type, []):
-        if field not in inputs and widget_idx < len(widgets_values):
-            inputs[field] = widgets_values[widget_idx]
-            widget_idx += 1
+        for field in EXTRA_WIDGET_FIELDS.get(class_type, []):
+            if field not in inputs and field not in SKIP_WIDGET_FIELDS and widget_idx < len(widgets_values):
+                inputs[field] = widgets_values[widget_idx]
+                widget_idx += 1
 
     return {"class_type": class_type, "inputs": inputs}
 
 
+def _local_subgraph_wrappers(
+    nodes: List[Dict[str, Any]],
+    subgraphs_by_uuid: Dict[str, Dict[str, Any]],
+) -> Dict[int, str]:
+    wrappers: Dict[int, str] = {}
+    for node in nodes:
+        node_type = node.get("type")
+        if node_type in subgraphs_by_uuid:
+            wrappers[int(node["id"])] = node_type
+    return wrappers
+
+
+def expand_subgraph_into_workflow(
+    workflow: Dict[str, Any],
+    sg_uuid: str,
+    wrapper: Dict[str, Any],
+    parent_links: Dict[int, Dict[str, Any]],
+    parent_bindings: Optional[Dict[int, Tuple[str, Any]]],
+    subgraphs_by_uuid: Dict[str, Dict[str, Any]],
+    parent_wrappers: Optional[Dict[int, str]] = None,
+) -> None:
+    subgraph = subgraphs_by_uuid[sg_uuid]
+    nodes = list(subgraph.get("nodes", []))
+    links_by_id = build_links_index(subgraph.get("links", []))
+    local_wrappers = _local_subgraph_wrappers(nodes, subgraphs_by_uuid)
+    # Линки на обёртку живут в родительском графе — резолвим через parent_wrappers.
+    wrappers_for_bindings = parent_wrappers if parent_wrappers is not None else local_wrappers
+    bindings = build_subgraph_bindings(
+        wrapper,
+        subgraph,
+        parent_links,
+        parent_bindings,
+        wrappers_for_bindings,
+        subgraphs_by_uuid,
+    )
+
+    for node in nodes:
+        if int(node.get("mode", 0) or 0) == BYPASS_MODE:
+            continue
+
+        node_type = node.get("type", "")
+        if node_type in SKIP_CLASS_TYPES:
+            continue
+
+        if node_type in subgraphs_by_uuid:
+            expand_subgraph_into_workflow(
+                workflow,
+                node_type,
+                node,
+                links_by_id,
+                bindings,
+                subgraphs_by_uuid,
+                parent_wrappers=local_wrappers,
+            )
+            continue
+
+        api_node = convert_ui_node_to_api(
+            node,
+            links_by_id,
+            bindings,
+            local_wrappers,
+            subgraphs_by_uuid,
+        )
+        if api_node is not None:
+            workflow[str(node["id"])] = api_node
+
+
+def collect_ui_graph(
+    data: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], List[Any], Dict[int, str], Dict[str, Dict[str, Any]]]:
+    """Совместимость: возвращает активные top-level узлы для extract_models."""
+    subgraphs = data.get("definitions", {}).get("subgraphs", [])
+    subgraphs_by_uuid = {sg["id"]: sg for sg in subgraphs}
+    subgraph_wrappers: Dict[int, str] = {}
+    nodes: List[Dict[str, Any]] = []
+    links = list(data.get("links", []))
+
+    for node in data.get("nodes", []):
+        if int(node.get("mode", 0) or 0) == BYPASS_MODE:
+            continue
+        node_type = node.get("type")
+        if node_type in subgraphs_by_uuid:
+            subgraph_wrappers[int(node["id"])] = node_type
+            sg = subgraphs_by_uuid[node_type]
+            nodes.extend(sg.get("nodes", []))
+            links.extend(sg.get("links", []))
+            continue
+        if node_type in SKIP_CLASS_TYPES:
+            continue
+        nodes.append(node)
+
+    return nodes, links, subgraph_wrappers, subgraphs_by_uuid
+
+
 def ui_to_api_workflow(data: Dict[str, Any]) -> Dict[str, Any]:
-    ui_nodes, links, subgraph_wrappers, subgraphs_by_uuid = collect_ui_graph(data)
-    links_by_id = build_links_index(links)
+    subgraphs = data.get("definitions", {}).get("subgraphs", [])
+    subgraphs_by_uuid = {sg["id"]: sg for sg in subgraphs}
+    top_links = build_links_index(data.get("links", []))
+    top_wrappers = _local_subgraph_wrappers(data.get("nodes", []), subgraphs_by_uuid)
     workflow: Dict[str, Any] = {}
 
-    for node in ui_nodes:
-        api_node = convert_ui_node_to_api(node, links_by_id, subgraph_wrappers, subgraphs_by_uuid)
-        if api_node is None:
+    for node in data.get("nodes", []):
+        if int(node.get("mode", 0) or 0) == BYPASS_MODE:
             continue
-        workflow[str(node["id"])] = api_node
+
+        node_type = node.get("type", "")
+        if node_type in SKIP_CLASS_TYPES:
+            continue
+
+        if node_type in subgraphs_by_uuid:
+            expand_subgraph_into_workflow(
+                workflow,
+                node_type,
+                node,
+                top_links,
+                None,
+                subgraphs_by_uuid,
+                parent_wrappers=top_wrappers,
+            )
+            continue
+
+        api_node = convert_ui_node_to_api(
+            node,
+            top_links,
+            None,
+            top_wrappers,
+            subgraphs_by_uuid,
+        )
+        if api_node is not None:
+            workflow[str(node["id"])] = api_node
 
     return workflow
 
@@ -396,6 +614,16 @@ def prepare_workflow_data(data: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[st
     if is_ui_workflow(data):
         ui_nodes, _, _, _ = collect_ui_graph(data)
         imported_models = extract_models_from_ui_nodes(ui_nodes)
+        # Также модели из вложенных узлов активных subgraph
+        for node in data.get("nodes", []):
+            if int(node.get("mode", 0) or 0) == BYPASS_MODE:
+                continue
+            props_models = node.get("properties", {}).get("models")
+            if props_models:
+                imported_models = merge_models(
+                    imported_models,
+                    extract_models_from_ui_nodes([node]),
+                )
         workflow = ui_to_api_workflow(data)
         if imported_models:
             meta["_models_imported"] = merge_models(meta.get("_models", {}), imported_models)
@@ -449,8 +677,49 @@ def auto_build_inputs(workflow: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
         for field, value in node.get("inputs", {}).items():
             if field in SKIP_INPUT_FIELDS or not is_editable(value):
                 continue
+            # Линк, ошибочно попавший как строка вида "nearest-exact" на IMAGE-вход — не API-параметр,
+            # если у узла поле image и class не LoadImage (обрабатывается ниже отдельно).
             key = f"{node_id}_{field}"
             inputs[key] = {"node": node_id, "field": field}
+
+    # Удобные алиасы для референсов: image, image_1, ...
+    image_nodes = [
+        node_id
+        for node_id in sort_node_ids(list(workflow.keys()))
+        if workflow[node_id].get("class_type") == "LoadImage"
+        and "image" in workflow[node_id].get("inputs", {})
+    ]
+    for index, node_id in enumerate(image_nodes):
+        alias = "image" if index == 0 else f"image_{index}"
+        inputs[alias] = {"node": node_id, "field": "image"}
+        inputs.setdefault(f"{node_id}_image", {"node": node_id, "field": "image"})
+
+    if image_nodes:
+        inputs["images"] = {
+            "type": "image_array",
+            "field": "image",
+            "nodes": image_nodes,
+            "max_items": len(image_nodes),
+        }
+
+    # Алиас prompt для текстового промпта
+    text_nodes = [
+        node_id
+        for node_id in sort_node_ids(list(workflow.keys()))
+        if workflow[node_id].get("class_type") == "CLIPTextEncode"
+        and isinstance(workflow[node_id].get("inputs", {}).get("text"), str)
+    ]
+    if text_nodes and "prompt" not in inputs:
+        inputs["prompt"] = {"node": text_nodes[0], "field": "text"}
+
+    seed_nodes = [
+        node_id
+        for node_id in sort_node_ids(list(workflow.keys()))
+        if workflow[node_id].get("class_type") == "RandomNoise"
+        and "noise_seed" in workflow[node_id].get("inputs", {})
+    ]
+    if seed_nodes and "seed" not in inputs:
+        inputs["seed"] = {"node": seed_nodes[0], "field": "noise_seed"}
 
     return inputs
 

@@ -4,10 +4,13 @@
 Workflow читается из папки workflow/ (сырой UI-экспорт ComfyUI).
 Конвертация и _inputs/_output/_models — автоматически при загрузке.
 """
+import base64
 import copy
 import io
 import json
+import mimetypes
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -15,7 +18,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import websocket
 from PIL import Image
@@ -23,6 +26,8 @@ from PIL import Image
 from .workflow_loader import LoadedWorkflow, load_workflow, resolve_workflow_source
 
 COMFYUI_URL = os.getenv("COMFYUI_URL", "127.0.0.1:8188")
+DATA_URL_RE = re.compile(r"^data:([^;]+);base64,(.+)$", re.DOTALL)
+
 
 
 class ComfyUIClient:
@@ -86,6 +91,156 @@ class ComfyUIClient:
             self._load_workflow_template()
         return self._inputs_config
 
+    def _looks_like_image_value(self, value: Any) -> bool:
+        if not isinstance(value, str) or not value.strip():
+            return False
+        text = value.strip()
+        if text.startswith("data:image/"):
+            return True
+        if text.startswith("http://") or text.startswith("https://"):
+            return True
+        # Сырой base64 (длинная строка без расширения файла)
+        if len(text) > 256 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", text):
+            return True
+        return False
+
+    def _decode_image_payload(self, value: str) -> Tuple[bytes, str]:
+        text = value.strip()
+        match = DATA_URL_RE.match(text)
+        if match:
+            mime = match.group(1).strip()
+            raw = base64.b64decode(match.group(2))
+            ext = mimetypes.guess_extension(mime) or ".png"
+            if ext == ".jpe":
+                ext = ".jpg"
+            return raw, f"upload{ext}"
+
+        if text.startswith("http://") or text.startswith("https://"):
+            with urllib.request.urlopen(text, timeout=60) as response:
+                raw = response.read()
+                content_type = response.headers.get("Content-Type", "image/png")
+            ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ".png"
+            if ext == ".jpe":
+                ext = ".jpg"
+            name = Path(urllib.parse.urlparse(text).path).name or f"upload{ext}"
+            if "." not in name:
+                name = f"{name}{ext}"
+            return raw, name
+
+        # Сырой base64
+        raw = base64.b64decode(text)
+        return raw, "upload.png"
+
+    def _upload_image_bytes(self, image_bytes: bytes, filename: str) -> str:
+        boundary = f"----ComfyUpload{uuid.uuid4().hex}"
+        filename = Path(filename).name or "upload.png"
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+        body = b"".join(
+            [
+                f"--{boundary}\r\n".encode(),
+                (
+                    f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'
+                    f"Content-Type: {content_type}\r\n\r\n"
+                ).encode(),
+                image_bytes,
+                b"\r\n",
+                f"--{boundary}\r\n".encode(),
+                b'Content-Disposition: form-data; name="type"\r\n\r\n',
+                b"input\r\n",
+                f"--{boundary}\r\n".encode(),
+                b'Content-Disposition: form-data; name="overwrite"\r\n\r\n',
+                b"true\r\n",
+                f"--{boundary}--\r\n".encode(),
+            ]
+        )
+
+        req = urllib.request.Request(
+            f"http://{self.server_url}/upload/image",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                result = json.loads(response.read())
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8") if e.fp else "No error body"
+            raise RuntimeError(f"ComfyUI upload failed ({e.code}): {error_body[:500]}") from e
+
+        name = result.get("name")
+        if not name:
+            raise RuntimeError(f"ComfyUI upload вернул неожиданный ответ: {result}")
+        subfolder = result.get("subfolder") or ""
+        return f"{subfolder}/{name}" if subfolder else name
+
+    def _ensure_comfy_image(self, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("Параметр изображения должен быть строкой (filename, URL или base64)")
+        text = value.strip()
+        if not text:
+            raise ValueError("Пустое значение изображения")
+        if not self._looks_like_image_value(text):
+            # Уже имя файла в input/ ComfyUI
+            return text
+
+        raw, filename = self._decode_image_payload(text)
+        uploaded = self._upload_image_bytes(raw, filename)
+        print(f"Загружен референс в ComfyUI: {uploaded}", flush=True)
+        return uploaded
+
+    def _image_alias_params(self) -> list[str]:
+        """Порядок слотов референсов: image, image_1, image_2, ..."""
+        params: list[str] = []
+        if "image" in self._inputs_config and self._inputs_config["image"].get("type") != "image_array":
+            params.append("image")
+        index = 1
+        while f"image_{index}" in self._inputs_config:
+            params.append(f"image_{index}")
+            index += 1
+        return params
+
+    def _expand_images_array(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        prepared = dict(inputs)
+        image_params = self._image_alias_params()
+
+        images_list = None
+        if "images" in prepared:
+            images_list = prepared.pop("images")
+        elif isinstance(prepared.get("image"), (list, tuple)):
+            images_list = prepared.pop("image")
+
+        if images_list is None:
+            return prepared
+
+        if not isinstance(images_list, (list, tuple)):
+            raise ValueError("images должен быть массивом строк (base64 / data URL / URL / filename)")
+        if not image_params:
+            raise ValueError("В текущем workflow нет LoadImage для референсов")
+        if len(images_list) > len(image_params):
+            raise ValueError(
+                f"Передано {len(images_list)} картинок, а в workflow только {len(image_params)} "
+                f"слот(ов): {', '.join(image_params)}"
+            )
+        for param_name, value in zip(image_params, images_list):
+            prepared[param_name] = value
+        return prepared
+
+    def _prepare_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        if self._workflow_template is None:
+            self._load_workflow_template()
+
+        prepared = self._expand_images_array(inputs)
+        for param_name, mapping in self._inputs_config.items():
+            if param_name not in prepared:
+                continue
+            if mapping.get("type") == "image_array":
+                continue
+            field = str(mapping.get("field", ""))
+            if field == "image" or field.startswith("image_"):
+                prepared[param_name] = self._ensure_comfy_image(prepared[param_name])
+        return prepared
+
     def _apply_inputs(self, workflow: Dict[str, Any], inputs: Dict[str, Any]) -> Dict[str, Any]:
         if not self._inputs_config:
             raise ValueError(
@@ -93,14 +248,18 @@ class ComfyUIClient:
                 "Проверьте файл в папке workflow/."
             )
 
+        prepared = self._prepare_inputs(inputs)
+
         for param_name, mapping in self._inputs_config.items():
-            if param_name not in inputs:
+            if param_name not in prepared:
+                continue
+            if mapping.get("type") == "image_array":
                 continue
             node_id = str(mapping["node"])
             field = mapping["field"]
             if node_id not in workflow:
                 raise ValueError(f"Узел {node_id} не найден в workflow (параметр '{param_name}')")
-            workflow[node_id]["inputs"][field] = inputs[param_name]
+            workflow[node_id]["inputs"][field] = prepared[param_name]
 
         return workflow
 
