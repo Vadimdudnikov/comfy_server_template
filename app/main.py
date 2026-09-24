@@ -41,14 +41,14 @@ def check_comfyui_connection() -> bool:
 
 
 class RunRequest(BaseModel):
-    inputs: Dict[str, Any] = Field(default_factory=dict)
-    priority: Optional[str] = "low"
+    input: Dict[str, Any] = Field(default_factory=dict)
+    webhook: Optional[str] = None
     wait: Optional[bool] = False
-    callBackUrl: Optional[str] = None
+    priority: Optional[str] = "low"
 
-    @field_validator("callBackUrl")
+    @field_validator("webhook")
     @classmethod
-    def validate_call_back_url(cls, value: Optional[str]) -> Optional[str]:
+    def validate_webhook(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         url = value.strip()
@@ -56,7 +56,7 @@ class RunRequest(BaseModel):
             return None
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError("callBackUrl должен быть http(s)://...")
+            raise ValueError("webhook должен быть http(s)://...")
         return url
 
 
@@ -342,8 +342,8 @@ async def run(req: RunRequest, request: Request):
         "url": None,
         "image_url": None,
         "error": None,
-        "inputs": req.inputs,
-        "callBackUrl": req.callBackUrl,
+        "input": req.input,
+        "webhook": req.webhook,
         "public_base_url": public_base,
         "created_at": _now_ts(),
         "updated_at": _now_ts(),
@@ -351,7 +351,7 @@ async def run(req: RunRequest, request: Request):
 
     assert MAIN_LOOP is not None
     fut: asyncio.Future = MAIN_LOOP.create_future()
-    job = Job(job_id, req.inputs, priority, fut, call_back_url=req.callBackUrl)
+    job = Job(job_id, req.input, priority, fut, call_back_url=req.webhook)
 
     if priority == "high":
         HIGH_Q.append(job)
